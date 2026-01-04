@@ -102,7 +102,7 @@ class VLLMGenerator:
     def generate(
         self,
         prompts: List[str],
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 1024,
         temperature: float = 0.0,
         top_p: float = 1.0,
         num_samples: int = 1,
@@ -128,6 +128,118 @@ class VLLMGenerator:
             results.append(responses)
         
         return results
+
+# =============================================================================
+# Evaluator
+# =============================================================================
+
+class GSM8KEvaluator:
+    """Evaluator for GSM8K using verl methods."""
+    
+    def __init__(
+        self,
+        model_name: str,
+        extraction_method: str = "strict",
+        # vLLM options
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: int = 4096,
+    ):
+        self.model_name = model_name
+        self.extraction_method = extraction_method
+        
+        self.generator = VLLMGenerator(
+            model_name,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+        )
+        
+        self.tokenizer = self.generator.tokenizer
+    
+    def format_prompt(self, prompt_messages: List[Dict]) -> str:
+        """Format prompt using chat template."""
+        return self.tokenizer.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    
+    def evaluate_batch(
+        self,
+        problems: List[Dict],
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        num_samples: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Evaluate a batch of problems."""
+        # Format prompts
+        prompts = [self.format_prompt(p["prompt"]) for p in problems]
+        ground_truths = [p["reward_model"]["ground_truth"] for p in problems]
+        
+        # Generate responses
+        all_responses = self.generator.generate(
+            prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            num_samples=num_samples,
+        )
+        
+        # Score responses using verl's compute_score
+        results = []
+        for i, (problem, responses) in enumerate(zip(problems, all_responses)):
+            ground_truth = ground_truths[i]
+            
+            # Use verl's functions directly
+            extracted_answers = [
+                verl_gsm8k.extract_solution(r, method=self.extraction_method) 
+                for r in responses
+            ]
+            scores = [
+                verl_gsm8k.compute_score(r, ground_truth, method=self.extraction_method) 
+                for r in responses
+            ]
+            
+            n_correct = sum(scores)
+            
+            result = {
+                "index": problem.get("extra_info", {}).get("index", i),
+                "question": problem.get("extra_info", {}).get("question", ""),
+                "ground_truth": ground_truth,
+                "responses": responses,
+                "extracted_answers": extracted_answers,
+                "scores": scores,
+                "pass@1": scores[0] if scores else 0,
+                "n_correct": n_correct,
+                "n_total": len(scores),
+            }
+            
+            # Compute pass@k for various k values
+            for k in [1, 4, 8, 16, 32, 64]:
+                if k <= num_samples:
+                    result[f"pass@{k}"] = pass_at_k(num_samples, int(n_correct), k)
+            
+            # Compute majority vote accuracy
+            if num_samples > 1:
+                majority_answer = majority_vote(extracted_answers)
+                try:
+                    result["maj_vote_correct"] = (
+                        float(majority_answer) == float(ground_truth) 
+                        if majority_answer else False
+                    )
+                except (ValueError, TypeError):
+                    result["maj_vote_correct"] = (
+                        majority_answer == ground_truth 
+                        if majority_answer else False
+                    )
+                result["majority_answer"] = majority_answer
+            
+            results.append(result)
+        
+        return results
+
 
 # =============================================================================
 # Data Loading
@@ -177,7 +289,6 @@ def evaluate(
     top_p: float = 1.0,
     max_new_tokens: int = 512,
     extraction_method: str = "strict",
-    backend: str = "vllm",
     batch_size: int = 32,
     output_file: str = None,
     save_responses: bool = False,
@@ -208,24 +319,15 @@ def evaluate(
     problems = load_gsm8k_parquet(data_dir, split=split, max_problems=max_problems)
     
     # Initialize evaluator
-    if backend == "vllm":
-        evaluator = GSM8KEvaluator(
-            model_name=model_name,
-            backend=backend,
-            extraction_method=extraction_method,
-            tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
-    else:
-        evaluator = GSM8KEvaluator(
-            model_name=model_name,
-            backend=backend,
-            extraction_method=extraction_method,
-        )
+    evaluator = GSM8KEvaluator(
+        model_name=model_name,
+        extraction_method=extraction_method,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
     
     # Evaluate
     print(f"\nEvaluating {len(problems)} problems...")
-    print(f"  backend: {backend}")
     print(f"  num_samples: {num_samples}")
     print(f"  temperature: {temperature}")
     print(f"  max_new_tokens: {max_new_tokens}")
@@ -241,41 +343,17 @@ def evaluate(
     start_time = time.time()
     
     # Process in batches for vLLM
-    if backend == "vllm":
-        for i in tqdm(range(0, len(problems), batch_size), desc="Evaluating"):
-            batch = problems[i:i + batch_size]
-            batch_results = evaluator.evaluate_batch(
-                batch,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                num_samples=num_samples,
-            )
-            
-            for result in batch_results:
-                all_pass1.append(result["pass@1"])
-                for k in all_pass_k:
-                    if f"pass@{k}" in result:
-                        all_pass_k[k].append(result[f"pass@{k}"])
-                if "maj_vote_correct" in result:
-                    all_maj_correct.append(result["maj_vote_correct"])
-                
-                if not save_responses:
-                    result.pop("responses", None)
-                
-                results.append(result)
-    else:
-        # Process one at a time for HF
-        for problem in tqdm(problems, desc="Evaluating"):
-            batch_results = evaluator.evaluate_batch(
-                [problem],
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                num_samples=num_samples,
-            )
-            result = batch_results[0]
-            
+    for i in tqdm(range(0, len(problems), batch_size), desc="Evaluating"):
+        batch = problems[i:i + batch_size]
+        batch_results = evaluator.evaluate_batch(
+            batch,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            num_samples=num_samples,
+        )
+        
+        for result in batch_results:
             all_pass1.append(result["pass@1"])
             for k in all_pass_k:
                 if f"pass@{k}" in result:
@@ -298,7 +376,6 @@ def evaluate(
         "num_samples": num_samples,
         "temperature": temperature,
         "extraction_method": extraction_method,
-        "backend": backend,
         "pass@1": np.mean(all_pass1),
         "elapsed_time": elapsed_time,
         "problems_per_second": len(problems) / elapsed_time,
@@ -317,7 +394,6 @@ def evaluate(
     print("=" * 60)
     print(f"Model: {model_name}")
     print(f"Dataset: GSM8K {split} ({len(problems)} problems)")
-    print(f"Backend: {backend}")
     print(f"Extraction: {extraction_method}")
     print(f"Time: {elapsed_time:.1f}s ({metrics['problems_per_second']:.2f} problems/s)")
     print()
@@ -344,7 +420,6 @@ def evaluate(
                 "top_p": top_p,
                 "max_new_tokens": max_new_tokens,
                 "extraction_method": extraction_method,
-                "backend": backend,
                 "batch_size": batch_size,
             },
             "timestamp": datetime.now().isoformat(),
@@ -418,7 +493,6 @@ def main():
         top_p=args.top_p,
         max_new_tokens=args.max_new_tokens,
         extraction_method=args.extraction_method,
-        backend=args.backend,
         batch_size=args.batch_size,
         output_file=args.output,
         save_responses=args.save_responses,
@@ -429,4 +503,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
