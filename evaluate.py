@@ -37,8 +37,9 @@ class EvalConfig:
     """Evaluation configuration."""
     model: str = "Qwen/Qwen2.5-Math-1.5B"
     template: str = "qwen_math"  # qwen_math, r1, llama_instruct
-    tasks: str = "aime,amc,math,minerva,olympiad_bench"
+    tasks: str = "aime,amc,math,minerva,olympiad_bench"  # can include "gsm8k"
     dataset_path: str = "./understand-r1-zero/datasets/evaluation_suite"
+    gsm8k_data_dir: str = None  # Path to preprocessed GSM8K parquet (optional)
     
     # Generation parameters
     temperature: float = 0.0
@@ -50,10 +51,12 @@ class EvalConfig:
     max_model_len: int = 4096
     batch_size: int = 16
     gpu_memory_utilization: float = 0.9
+    tensor_parallel_size: int = 1
     
     # Output
-    output_dir: str = "./evaluation/results"
+    output_dir: str = "./rl-eval/results"
     save: bool = False
+    save_responses: bool = False
     max_problems: int = 999999  # Limit for quick testing
 
 
@@ -476,6 +479,7 @@ class Evaluator:
         print(f"\n{'='*60}")
         print(f"Loading model: {self.config.model}")
         print(f"Template: {self.config.template}")
+        print(f"Tensor Parallel: {self.config.tensor_parallel_size}")
         print(f"{'='*60}\n")
         
         # Initialize vLLM
@@ -484,6 +488,8 @@ class Evaluator:
             max_model_len=self.config.max_model_len,
             dtype="bfloat16",
             gpu_memory_utilization=self.config.gpu_memory_utilization,
+            tensor_parallel_size=self.config.tensor_parallel_size,
+            trust_remote_code=True,
             enable_prefix_caching=True,
             swap_space=16,
         )
@@ -498,18 +504,89 @@ class Evaluator:
     
     def load_datasets(self) -> Dict[str, any]:
         """Load evaluation datasets."""
-        from datasets import load_from_disk
-        
-        dataset_path = Path(self.config.dataset_path)
-        if not dataset_path.exists():
-            # Try relative to script
-            dataset_path = Path(__file__).parent.parent / "understand-r1-zero/datasets/evaluation_suite"
-        
-        print(f"Loading datasets from: {dataset_path}")
-        datasets = load_from_disk(str(dataset_path))
+        from datasets import load_from_disk, load_dataset, Dataset
         
         task_list = [t.strip() for t in self.config.tasks.split(",")]
-        return {k: v for k, v in datasets.items() if k in task_list}
+        result_datasets = {}
+        
+        # Load GSM8K separately if requested
+        if "gsm8k" in task_list:
+            gsm8k_data = self._load_gsm8k()
+            if gsm8k_data is not None:
+                result_datasets["gsm8k"] = gsm8k_data
+            task_list = [t for t in task_list if t != "gsm8k"]
+        
+        # Load other datasets from evaluation suite
+        if task_list:
+            dataset_path = Path(self.config.dataset_path)
+            if not dataset_path.exists():
+                # Try relative to script
+                dataset_path = Path(__file__).parent.parent / "understand-r1-zero/datasets/evaluation_suite"
+            
+            if dataset_path.exists():
+                print(f"Loading datasets from: {dataset_path}")
+                datasets = load_from_disk(str(dataset_path))
+                for k, v in datasets.items():
+                    if k in task_list:
+                        result_datasets[k] = v
+            elif task_list:
+                print(f"Warning: Dataset path not found: {dataset_path}")
+                print(f"Skipping tasks: {task_list}")
+        
+        return result_datasets
+    
+    def _load_gsm8k(self):
+        """Load GSM8K dataset from local parquet or HuggingFace."""
+        from datasets import load_dataset, Dataset
+        
+        # Try local parquet first
+        if self.config.gsm8k_data_dir:
+            parquet_path = Path(self.config.gsm8k_data_dir) / "test.parquet"
+            if parquet_path.exists():
+                print(f"Loading GSM8K from local parquet: {parquet_path}")
+                raw_data = Dataset.from_parquet(str(parquet_path))
+                # Convert to expected format (problem, answer)
+                def convert_verl_format(example):
+                    # Handle verl preprocessed format
+                    if "prompt" in example and isinstance(example["prompt"], list):
+                        question = example["prompt"][0]["content"]
+                    elif "extra_info" in example and "question" in example["extra_info"]:
+                        question = example["extra_info"]["question"]
+                    else:
+                        question = str(example.get("prompt", ""))
+                    
+                    # Get ground truth
+                    if "reward_model" in example and "ground_truth" in example["reward_model"]:
+                        answer = example["reward_model"]["ground_truth"]
+                    else:
+                        answer = str(example.get("answer", ""))
+                    
+                    return {"problem": question, "answer": answer}
+                
+                return raw_data.map(convert_verl_format)
+        
+        # Fall back to HuggingFace
+        print("Loading GSM8K from HuggingFace (openai/gsm8k)...")
+        try:
+            gsm8k = load_dataset("openai/gsm8k", "main", split="test")
+            # Convert to expected format (problem, answer)
+            def convert_hf_format(example):
+                return {
+                    "problem": example["question"],
+                    "answer": self._extract_gsm8k_answer(example["answer"]),
+                }
+            return gsm8k.map(convert_hf_format)
+        except Exception as e:
+            print(f"Warning: Could not load GSM8K: {e}")
+            return None
+    
+    @staticmethod
+    def _extract_gsm8k_answer(answer_str: str) -> str:
+        """Extract final answer from GSM8K answer format (#### ANSWER)."""
+        match = re.search(r"####\s*(-?[\d,]+\.?\d*)", answer_str)
+        if match:
+            return match.group(1).replace(",", "")
+        return answer_str
     
     def evaluate_task(self, task_name: str, dataset) -> Dict:
         """Evaluate on a single task."""
@@ -561,14 +638,16 @@ class Evaluator:
                     formatted_count += 1
                 
                 if j == 0:  # Store first sample details
-                    details.append({
+                    detail = {
                         "problem": problems[i],
                         "gt": gt,
-                        "response": response,
                         "extracted": info.get("extracted"),
                         "correct": reward > 0,
                         "formatted": info.get("formatted", False),
-                    })
+                    }
+                    if self.config.save_responses:
+                        detail["response"] = response
+                    details.append(detail)
             
             # For pass@k, use max score across samples
             scores.append(max(sample_scores))
@@ -686,14 +765,18 @@ def main(
     template: str = "qwen_math",
     tasks: str = "aime,amc,math,minerva,olympiad_bench",
     dataset_path: str = None,
+    gsm8k_data_dir: str = None,
     temperature: float = 0.0,
     top_p: float = 1.0,
     max_tokens: int = 3000,
     n_samples: int = 1,
     max_model_len: int = 4096,
     batch_size: int = 16,
-    output_dir: str = "./evaluation/results",
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.9,
+    output_dir: str = "./rl-eval/results",
     save: bool = False,
+    save_responses: bool = False,
     max_problems: int = 999999,
 ):
     """
@@ -702,16 +785,20 @@ def main(
     Args:
         model: Model name or path (HuggingFace or local)
         template: Prompt template (qwen_math, r1, llama_instruct)
-        tasks: Comma-separated list of tasks
+        tasks: Comma-separated list of tasks (aime,amc,math,minerva,olympiad_bench,gsm8k)
         dataset_path: Path to evaluation suite dataset
+        gsm8k_data_dir: Path to preprocessed GSM8K parquet files (optional)
         temperature: Sampling temperature (0 for greedy)
         top_p: Top-p sampling parameter
         max_tokens: Maximum tokens to generate
         n_samples: Number of samples per problem (for pass@k)
         max_model_len: Maximum model context length
         batch_size: Inference batch size
+        tensor_parallel_size: Number of GPUs for tensor parallelism
+        gpu_memory_utilization: GPU memory utilization
         output_dir: Directory to save results
         save: Whether to save detailed results
+        save_responses: Whether to save full model responses
         max_problems: Maximum problems per task (for quick testing)
     
     Examples:
@@ -723,9 +810,18 @@ def main(
         
         # Quick test on MATH only
         python evaluate.py --model your_model --tasks math --max_problems 50
+        
+        # GSM8K evaluation
+        python evaluate.py --model your_model --tasks gsm8k --template qwen_math
+        
+        # GSM8K with local preprocessed data
+        python evaluate.py --model your_model --tasks gsm8k --gsm8k_data_dir /workspace/data/gsm8k
     """
-    # Find dataset path
-    if dataset_path is None:
+    # Find dataset path (only needed for non-GSM8K tasks)
+    task_list = [t.strip() for t in tasks.split(",")]
+    non_gsm8k_tasks = [t for t in task_list if t != "gsm8k"]
+    
+    if dataset_path is None and non_gsm8k_tasks:
         # Try common locations
         candidates = [
             "./understand-r1-zero/datasets/evaluation_suite",
@@ -737,23 +833,28 @@ def main(
                 dataset_path = candidate
                 break
         else:
-            raise FileNotFoundError(
-                "Could not find evaluation dataset. Please specify --dataset_path"
-            )
+            if non_gsm8k_tasks:
+                print(f"Warning: Could not find evaluation dataset for tasks: {non_gsm8k_tasks}")
+                print("Specify --dataset_path or only use --tasks gsm8k")
+            dataset_path = "./understand-r1-zero/datasets/evaluation_suite"
     
     config = EvalConfig(
         model=model,
         template=template,
         tasks=tasks,
-        dataset_path=dataset_path,
+        dataset_path=dataset_path or "./understand-r1-zero/datasets/evaluation_suite",
+        gsm8k_data_dir=gsm8k_data_dir,
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
         n_samples=n_samples,
         max_model_len=max_model_len,
         batch_size=batch_size,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
         output_dir=output_dir,
         save=save,
+        save_responses=save_responses,
         max_problems=max_problems,
     )
     
