@@ -76,9 +76,10 @@ def compute_rewards_batch(
     extraction_method: str = "strict",
 ) -> List[float]:
     """
-    Compute rewards for a batch of responses using verl's default_compute_score.
+    Compute rewards for a batch of responses.
     
-    This follows the pattern from verl/workers/reward_manager/naive.py
+    For GSM8K, uses verl's gsm8k.compute_score directly with the specified method.
+    For other datasets, uses default_compute_score.
     
     Args:
         responses: List of model response strings
@@ -92,12 +93,20 @@ def compute_rewards_batch(
     rewards = []
     
     for response, ground_truth, data_source in zip(responses, ground_truths, data_sources):
-        # Use verl's default_compute_score which routes based on data_source
-        score = default_compute_score(
-            data_source=data_source,
-            solution_str=response,
-            ground_truth=ground_truth,
-        )
+        if data_source == "openai/gsm8k":
+            # Use verl's gsm8k.compute_score directly with extraction_method
+            score = verl_gsm8k.compute_score(
+                solution_str=response,
+                ground_truth=ground_truth,
+                method=extraction_method,
+            )
+        else:
+            # Use default_compute_score for other datasets
+            score = default_compute_score(
+                data_source=data_source,
+                solution_str=response,
+                ground_truth=ground_truth,
+            )
         
         if isinstance(score, dict):
             reward = score.get("score", 0.0)
