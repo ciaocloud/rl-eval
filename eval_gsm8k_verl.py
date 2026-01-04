@@ -5,22 +5,16 @@ GSM8K Evaluation Script using verl methods and vLLM for fast inference.
 Prerequisites:
     1. Preprocess GSM8K dataset:
        python scripts/preprocess_gsm8k.py --local_save_dir data/gsm8k
-    
-    2. Install vLLM (optional, for fast inference):
-       pip install vllm
 
 Usage:
-    # Evaluate with vLLM (fast, recommended)
-    python scripts/eval_gsm8k_verl.py --model Qwen/Qwen2.5-0.5B-Instruct --backend vllm
-    
-    # Evaluate with HuggingFace (slower, no vLLM dependency)
-    python scripts/eval_gsm8k_verl.py --model Qwen/Qwen2.5-0.5B-Instruct --backend hf
+    # Evaluate with vLLM
+    python rl-eval/eval_gsm8k_verl.py --model Qwen/Qwen2.5-0.5B-Instruct
     
     # pass@8 evaluation with sampling
-    python scripts/eval_gsm8k_verl.py --model Qwen/Qwen2.5-0.5B-Instruct --num_samples 8 --temperature 0.7
+    python rl-eval/eval_gsm8k_verl.py --model Qwen/Qwen2.5-0.5B-Instruct --num_samples 8 --temperature 0.7
     
-    # Use flexible answer extraction (supports boxed, bold, etc.)
-    python scripts/eval_gsm8k_verl.py --model Qwen/Qwen2.5-0.5B-Instruct --extraction_method flexible
+    # Use flexible answer extraction
+    python rl-eval/eval_gsm8k_verl.py --model Qwen/Qwen2.5-0.5B-Instruct --extraction_method flexible
 """
 
 import argparse
@@ -31,14 +25,16 @@ from collections import Counter
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-import torch
 import numpy as np
 from scipy.special import comb
 from tqdm import tqdm
 import datasets
 
-# Import verl's reward scoring (required)
+from vllm import LLM, SamplingParams
+
+# Import verl's reward scoring
 from verl.utils.reward_score import gsm8k as verl_gsm8k
+from verl.utils.reward_score import default_compute_score
 
 
 # =============================================================================
@@ -70,7 +66,71 @@ def majority_vote(answers: List[str]) -> Optional[str]:
 
 
 # =============================================================================
-# vLLM Backend
+# Reward Computation (following verl's NaiveRewardManager pattern)
+# =============================================================================
+
+def compute_rewards_batch(
+    responses: List[str],
+    ground_truths: List[str],
+    data_sources: List[str],
+    extraction_method: str = "strict",
+) -> List[float]:
+    """
+    Compute rewards for a batch of responses using verl's default_compute_score.
+    
+    This follows the pattern from verl/workers/reward_manager/naive.py
+    
+    Args:
+        responses: List of model response strings
+        ground_truths: List of ground truth answers
+        data_sources: List of data source identifiers (e.g., "openai/gsm8k")
+        extraction_method: "strict" or "flexible"
+    
+    Returns:
+        List of reward scores
+    """
+    rewards = []
+    
+    for response, ground_truth, data_source in zip(responses, ground_truths, data_sources):
+        # Use verl's default_compute_score which routes based on data_source
+        score = default_compute_score(
+            data_source=data_source,
+            solution_str=response,
+            ground_truth=ground_truth,
+        )
+        
+        if isinstance(score, dict):
+            reward = score.get("score", 0.0)
+        else:
+            reward = float(score)
+        
+        rewards.append(reward)
+    
+    return rewards
+
+
+def extract_answers_batch(
+    responses: List[str],
+    extraction_method: str = "strict",
+) -> List[Optional[str]]:
+    """
+    Extract answers from a batch of responses using verl's gsm8k.extract_solution.
+    
+    Args:
+        responses: List of model response strings
+        extraction_method: "strict" or "flexible"
+    
+    Returns:
+        List of extracted answers (None if extraction failed)
+    """
+    return [
+        verl_gsm8k.extract_solution(r, method=extraction_method) 
+        for r in responses
+    ]
+
+
+# =============================================================================
+# vLLM Generator
 # =============================================================================
 
 class VLLMGenerator:
@@ -83,10 +143,7 @@ class VLLMGenerator:
         gpu_memory_utilization: float = 0.9,
         max_model_len: int = 4096,
     ):
-        from vllm import LLM, SamplingParams
-        
         self.model_name = model_name
-        self.SamplingParams = SamplingParams
         
         print(f"Loading vLLM model: {model_name}")
         self.llm = LLM(
@@ -97,9 +154,9 @@ class VLLMGenerator:
             trust_remote_code=True,
         )
         self.tokenizer = self.llm.get_tokenizer()
-        print(f"Model loaded with vLLM")
+        print(f"Model loaded with vLLM (tp={tensor_parallel_size})")
     
-    def generate(
+    def generate_batch(
         self,
         prompts: List[str],
         max_new_tokens: int = 1024,
@@ -113,7 +170,7 @@ class VLLMGenerator:
         Returns:
             List of lists, each containing num_samples responses per prompt.
         """
-        sampling_params = self.SamplingParams(
+        sampling_params = SamplingParams(
             temperature=temperature if temperature > 0 else 0.0,
             top_p=top_p,
             max_tokens=max_new_tokens,
@@ -129,18 +186,18 @@ class VLLMGenerator:
         
         return results
 
+
 # =============================================================================
 # Evaluator
 # =============================================================================
 
 class GSM8KEvaluator:
-    """Evaluator for GSM8K using verl methods."""
+    """Evaluator for GSM8K using verl methods and vLLM."""
     
     def __init__(
         self,
         model_name: str,
         extraction_method: str = "strict",
-        # vLLM options
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: int = 4096,
@@ -154,7 +211,6 @@ class GSM8KEvaluator:
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
         )
-        
         self.tokenizer = self.generator.tokenizer
     
     def format_prompt(self, prompt_messages: List[Dict]) -> str:
@@ -173,13 +229,21 @@ class GSM8KEvaluator:
         top_p: float = 1.0,
         num_samples: int = 1,
     ) -> List[Dict[str, Any]]:
-        """Evaluate a batch of problems."""
+        """
+        Evaluate a batch of problems.
+        
+        Uses verl's reward computation pattern:
+        1. Generate responses with vLLM
+        2. Compute rewards using default_compute_score (routes by data_source)
+        3. Extract answers using gsm8k.extract_solution
+        """
         # Format prompts
         prompts = [self.format_prompt(p["prompt"]) for p in problems]
         ground_truths = [p["reward_model"]["ground_truth"] for p in problems]
+        data_sources = [p.get("data_source", "openai/gsm8k") for p in problems]
         
-        # Generate responses
-        all_responses = self.generator.generate(
+        # Generate responses with vLLM
+        all_responses = self.generator.generate_batch(
             prompts,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -187,20 +251,25 @@ class GSM8KEvaluator:
             num_samples=num_samples,
         )
         
-        # Score responses using verl's compute_score
+        # Process results
         results = []
         for i, (problem, responses) in enumerate(zip(problems, all_responses)):
             ground_truth = ground_truths[i]
+            data_source = data_sources[i]
             
-            # Use verl's functions directly
-            extracted_answers = [
-                verl_gsm8k.extract_solution(r, method=self.extraction_method) 
-                for r in responses
-            ]
-            scores = [
-                verl_gsm8k.compute_score(r, ground_truth, method=self.extraction_method) 
-                for r in responses
-            ]
+            # Compute rewards for all samples using verl's default_compute_score
+            scores = compute_rewards_batch(
+                responses=responses,
+                ground_truths=[ground_truth] * len(responses),
+                data_sources=[data_source] * len(responses),
+                extraction_method=self.extraction_method,
+            )
+            
+            # Extract answers using verl's gsm8k.extract_solution
+            extracted_answers = extract_answers_batch(
+                responses=responses,
+                extraction_method=self.extraction_method,
+            )
             
             n_correct = sum(scores)
             
@@ -208,6 +277,7 @@ class GSM8KEvaluator:
                 "index": problem.get("extra_info", {}).get("index", i),
                 "question": problem.get("extra_info", {}).get("question", ""),
                 "ground_truth": ground_truth,
+                "data_source": data_source,
                 "responses": responses,
                 "extracted_answers": extracted_answers,
                 "scores": scores,
@@ -294,9 +364,10 @@ def evaluate(
     save_responses: bool = False,
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
+    max_model_len: int = 4096,
 ) -> Dict[str, float]:
     """
-    Run evaluation on GSM8K.
+    Run evaluation on GSM8K using vLLM and verl's reward functions.
     
     Args:
         model_name: HuggingFace model name or path
@@ -308,12 +379,12 @@ def evaluate(
         top_p: Top-p sampling parameter
         max_new_tokens: Maximum tokens to generate
         extraction_method: "strict" (#### only) or "flexible" (last number)
-        backend: "vllm" (fast) or "hf" (HuggingFace, slower)
-        batch_size: Batch size for vLLM (ignored for HF)
+        batch_size: Batch size for vLLM
         output_file: Path to save results JSON
         save_responses: Whether to save full responses
-        tensor_parallel_size: Number of GPUs for tensor parallelism (vLLM)
-        gpu_memory_utilization: GPU memory utilization (vLLM)
+        tensor_parallel_size: Number of GPUs for tensor parallelism
+        gpu_memory_utilization: GPU memory utilization
+        max_model_len: Maximum model context length
     """
     # Load dataset
     problems = load_gsm8k_parquet(data_dir, split=split, max_problems=max_problems)
@@ -324,6 +395,7 @@ def evaluate(
         extraction_method=extraction_method,
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
     )
     
     # Evaluate
@@ -342,7 +414,7 @@ def evaluate(
     
     start_time = time.time()
     
-    # Process in batches for vLLM
+    # Process in batches
     for i in tqdm(range(0, len(problems), batch_size), desc="Evaluating"):
         batch = problems[i:i + batch_size]
         batch_results = evaluator.evaluate_batch(
@@ -421,6 +493,7 @@ def evaluate(
                 "max_new_tokens": max_new_tokens,
                 "extraction_method": extraction_method,
                 "batch_size": batch_size,
+                "tensor_parallel_size": tensor_parallel_size,
             },
             "timestamp": datetime.now().isoformat(),
             "results": results,
@@ -435,13 +508,11 @@ def evaluate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate model on GSM8K using verl methods")
+    parser = argparse.ArgumentParser(description="Evaluate model on GSM8K using verl + vLLM")
     
     # Model
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct",
                         help="Model name or path")
-    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "hf"],
-                        help="Generation backend: 'vllm' (fast) or 'hf' (HuggingFace)")
     
     # Dataset
     parser.add_argument("--data_dir", type=str, default="/workspace/data/gsm8k",
@@ -470,9 +541,11 @@ def main():
     
     # vLLM options
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
-                        help="Number of GPUs for tensor parallelism (vLLM)")
+                        help="Number of GPUs for tensor parallelism")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9,
-                        help="GPU memory utilization (vLLM)")
+                        help="GPU memory utilization")
+    parser.add_argument("--max_model_len", type=int, default=4096,
+                        help="Maximum model context length")
     
     # Output
     parser.add_argument("--output", type=str, default=None,
@@ -498,6 +571,7 @@ def main():
         save_responses=args.save_responses,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
     )
 
 
